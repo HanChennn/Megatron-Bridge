@@ -113,6 +113,7 @@ _QWEN35_VL_GB200_FUNCS = [
     _qwen35_vl_gb200_module.qwen35_vl_35b_a3b_sft_long_context_32gpu_gb200_bf16_config,
     _qwen35_vl_gb200_module.qwen35_vl_35b_a3b_sft_long_context_32gpu_gb200_fp8mx_config,
     _qwen35_vl_gb200_module.qwen35_vl_35b_a3b_peft_8gpu_gb200_bf16_functional_config,
+    _qwen35_vl_gb200_module.qwen35_vl_397b_a17b_sft_long_context_64gpu_gb200_bf16_config,
 ]
 
 _QWEN35_VL_GB300_FUNCS = [
@@ -1773,6 +1774,90 @@ def test_gb200_long_context_validates_with_real_model_config(monkeypatch, recipe
     config.dataset.enable_in_batch_packing = True
     with pytest.raises(ValueError, match="mutually exclusive"):
         config.dataset.validate()
+
+
+def test_gb200_397b_long_context_baseline_validates(monkeypatch: pytest.MonkeyPatch):
+    """Check the 397B source, packing, loss policy, and 64-rank grid using the strict model schema.
+
+    The offline builder fixture uses the default MoE architecture; this checks
+    config compatibility, not 397B numerical correctness or memory feasibility.
+    """
+    model_sources = []
+
+    def from_hf_pretrained(hf_path: str):
+        model_sources.append(hf_path)
+        return _BuilderOnlyAutoBridge(hf_path)
+
+    monkeypatch.setattr(_BuilderOnlyAutoBridge, "from_hf_pretrained", from_hf_pretrained)
+    monkeypatch.setattr(_qwen35_vl_h100_module, "AutoBridge", _BuilderOnlyAutoBridge)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda index: SimpleNamespace(major=10, name="NVIDIA GB200")
+    )
+    config_module = importlib.import_module("megatron.bridge.training.config")
+    monkeypatch.setattr(config_module, "get_world_size_safe", lambda: 64)
+
+    recipe = _qwen35_vl_gb200_module.qwen35_vl_397b_a17b_sft_long_context_64gpu_gb200_bf16_config
+    for module_name in (
+        "megatron.bridge.recipes.qwen_vl.gb200",
+        "megatron.bridge.recipes.qwen_vl",
+        "megatron.bridge.recipes",
+    ):
+        assert getattr(importlib.import_module(module_name), recipe.__name__) is recipe
+    cfg = recipe()
+    _assert_basic_config(cfg)
+
+    assert model_sources == ["Qwen/Qwen3.5-397B-A17B"]
+    assert cfg.dataset.task_encoder.hf_processor_path == cfg.tokenizer.tokenizer_model == model_sources[0]
+    assert cfg.model.seq_length == cfg.dataset.seq_length == 131072
+    assert cfg.train.micro_batch_size == cfg.dataset.micro_batch_size == 1
+    assert cfg.train.global_batch_size == 32
+    assert cfg.model.tensor_model_parallel_size == cfg.model.pipeline_model_parallel_size == 1
+    assert cfg.model.context_parallel_size == 8
+    assert cfg.model.expert_model_parallel_size == 32
+    assert cfg.model.expert_tensor_parallel_size == 1
+    assert cfg.model.moe_token_dispatcher_type == "flex"
+    assert cfg.model.moe_flex_dispatcher_backend == "hybridep"
+    assert cfg.model.moe_router_force_load_balancing is False
+    assert cfg.model.calculate_per_token_loss is True
+    assert cfg.ddp.average_in_collective is False
+    assert cfg.model.mtp_num_layers == 1
+    assert cfg.model.mtp_loss_scaling_factor == 0.1
+    assert cfg.model.freeze_language_model is False
+    assert cfg.model.freeze_vision_model is False
+    assert cfg.model.freeze_vision_projection is False
+    assert cfg.dataset.packing_buffer_size == 16
+    assert cfg.dataset.enable_in_batch_packing is False
+    assert cfg.model.cuda_graph_impl == "none"
+    assert cfg.model.recompute_granularity == "selective"
+    assert cfg.model.recompute_modules == ["gdn_norm_out", "moe"]
+    assert cfg.model.vision_recompute_granularity == "full"
+    assert cfg.mixed_precision.fp8 is None
+
+    cfg.dataset.path = "prepared-clevr2-energon"
+    cfg.dataset.validate()
+    cfg.mixed_precision.finalize()
+    cfg.mixed_precision.setup(cfg.model, cfg.optimizer, cfg.ddp)
+    cfg.validate()
+    cfg.comm_overlap.finalize()
+    cfg.comm_overlap.setup(cfg.model, cfg.optimizer, cfg.ddp)
+    assert cfg.model.params_dtype == torch.bfloat16
+    assert cfg.dataset.pad_to_max_length is True
+    assert cfg.ddp.overlap_grad_reduce is False
+    assert cfg.ddp.overlap_param_gather is False
+    assert cfg.optimizer.overlap_param_gather is False
+    assert cfg.optimizer.overlap_param_gather_with_optimizer_step is False
+    assert cfg.model.overlap_moe_expert_parallel_comm is False
+
+    data_parallel_size = 64 // (
+        cfg.model.tensor_model_parallel_size
+        * cfg.model.pipeline_model_parallel_size
+        * cfg.model.context_parallel_size
+    )
+    assert data_parallel_size == 8
+    assert cfg.train.global_batch_size % (data_parallel_size * cfg.train.micro_batch_size) == 0
+    cfg.dataset.enable_in_batch_packing = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cfg.dataset.validate()
 
 
 def test_gb200_long_context_pins_model_and_processor_together(monkeypatch):
